@@ -236,7 +236,15 @@ export class ClientSystem {
     this.slashCommandHook = new SlashCommandHook(this.client);
     this.slashCommandHook.addBuiltin(querySlashCommand(client, builder));
 
-    this.mqHook = new MQHook(this.system, this.mq, this.client.config);
+    this.mqHook = new MQHook(
+      this.system,
+      this.mq,
+      this.client.config,
+      (queue) =>
+        queue === "indexQueue"
+          ? () => this.objectIndex.isForeignReindexRunning()
+          : undefined,
+    );
     this.system.addHook(this.mqHook);
 
     this.system.addHook(new SyscallHook());

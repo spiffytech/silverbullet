@@ -15,6 +15,15 @@ export type ProcessingMessage = MQMessage & {
   ts: number;
 };
 
+export type QueueWorkerOptions = MQSubscribeOptions & {
+  /**
+   * Consulted before every poll. While it returns true the worker leaves the
+   * queue alone entirely -- it does not lease messages and release them, which
+   * would slow the queue down for whoever is meant to be draining it.
+   */
+  pause?: () => boolean | Promise<boolean>;
+};
+
 const DEFAULT_LEASE_RENEW_INTERVAL = 2000;
 
 const queuedPrefix = ["mq", "queued"];
@@ -28,9 +37,26 @@ export class QueueWorker {
   constructor(
     private mq: DataStoreMQ,
     readonly queue: string,
-    readonly options: MQSubscribeOptions,
+    readonly options: QueueWorkerOptions,
     private callback: (messages: MQMessage[]) => Promise<void> | void,
   ) {}
+
+  /**
+   * A throw here lands in run()'s outer catch, which ends the loop and leaves
+   * the queue unprocessed for the rest of the session, so a failing predicate
+   * counts as "not paused" instead.
+   */
+  private async isPaused(): Promise<boolean> {
+    if (!this.options.pause) {
+      return false;
+    }
+    try {
+      return await this.options.pause();
+    } catch (e) {
+      console.error(`Pause check for queue "${this.queue}" failed`, e);
+      return false;
+    }
+  }
 
   /**
    * This is the main loop of the worker, whenever it exits the loop it means the worker has stopped
@@ -41,6 +67,10 @@ export class QueueWorker {
       while (true) {
         if (this.stopping) {
           break;
+        }
+        if (await this.isPaused()) {
+          await sleep(this.options.pollInterval || 1000);
+          continue;
         }
         const messages = await this.mq.poll(
           this.queue,
@@ -237,7 +267,7 @@ export class DataStoreMQ {
    */
   subscribe(
     queue: string,
-    options: MQSubscribeOptions,
+    options: QueueWorkerOptions,
     callback: (messages: MQMessage[]) => Promise<void> | void,
   ): QueueWorker {
     const worker = new QueueWorker(this, queue, options, callback);
