@@ -532,6 +532,11 @@ export class ObjectIndex {
     }
   }
 
+  private get reindexLockName(): string {
+    const dbName = (this.ds.kv as any).dbName ?? "default";
+    return `sb-reindex:${dbName}`;
+  }
+
   /**
    * Cross-window mutual exclusion for global reindex work.
    */
@@ -540,8 +545,49 @@ export class ObjectIndex {
     if (!locks?.request) {
       return fn();
     }
-    const dbName = (this.ds.kv as any).dbName ?? "default";
-    return locks.request(`sb-reindex:${dbName}`, fn);
+    return locks.request(this.reindexLockName, fn);
+  }
+
+  /**
+   * True while a different client on this database is midway through a
+   * wholesale reindex.
+   *
+   * Every client on one origin drains the same indexQueue, but each holds its
+   * own Space Lua snapshot, and `processObjectsToKVs` applies whichever
+   * snapshot the indexing client happens to have. A reindex spread across
+   * clients therefore writes two rule sets into one index, with the split
+   * decided by queue timing. Letting the reindexing client do all of its own
+   * work is what makes the result depend on one snapshot instead of several.
+   *
+   * Reports false when this client is the one reindexing: it has to keep
+   * draining, or the reindex it is waiting on never finishes.
+   *
+   * This checks "is someone else reindexing" rather than "is my config
+   * current", which is the property that actually matters. The direct check
+   * would compare this client's loaded scripts against the indexed
+   * `space-lua` objects, but a reindex empties and refills the index, so
+   * that comparison is meaningless for exactly as long as this guard is
+   * needed. Outside a reindex this returns false, and a stale client can
+   * still index individually changed pages under its old rules.
+   */
+  async isForeignReindexRunning(): Promise<boolean> {
+    if (this.rebuildInProgress) {
+      return false;
+    }
+    const locks = (navigator as any)?.locks;
+    if (!locks?.query) {
+      return false;
+    }
+    try {
+      const state = await locks.query();
+      return (state.held ?? []).some(
+        (lock: any) => lock.name === this.reindexLockName,
+      );
+    } catch {
+      // A browser that refuses the query is one we cannot coordinate through;
+      // indexing as before beats stalling the queue.
+      return false;
+    }
   }
 
   public async hasFullIndexCompleted() {
