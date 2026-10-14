@@ -61,13 +61,20 @@ async function openClient(page: Page, server: SBServer): Promise<void> {
     null,
     { timeout: 60_000 },
   );
-  await expect
-    .poll(() => tryEval(page, "1 + 1"), { timeout: 60_000 })
-    .toBe(2);
+  await expect.poll(() => tryEval(page, "1 + 1"), { timeout: 60_000 }).toBe(2);
 }
 
 const pageIsIndexed = (page: Page, name: string) =>
   tryEval(page, `#query[[from p = index.pages() where p.name == "${name}"]]`);
+
+const hasPageTransform = (page: Page): Promise<boolean> =>
+  page.evaluate(
+    () =>
+      !!(globalThis as any).client.config.get(
+        ["tags", "page", "transform"],
+        undefined,
+      ),
+  );
 
 test.describe("index consistency across clients", () => {
   test.use({ spaceFiles });
@@ -88,9 +95,12 @@ test.describe("index consistency across clients", () => {
     await openClient(stale, sbServer);
 
     await expect
-      .poll(() => pageIsIndexed(page, `p${String(PAGES - 1).padStart(4, "0")}`), {
-        timeout: 120_000,
-      })
+      .poll(
+        () => pageIsIndexed(page, `p${String(PAGES - 1).padStart(4, "0")}`),
+        {
+          timeout: 120_000,
+        },
+      )
       .toBeGreaterThan(0);
 
     // A transform neither client has loaded yet.
@@ -123,9 +133,12 @@ test.describe("index consistency across clients", () => {
     await writeFile(join(sbServer.spaceDir, "Transform.md"), transformPage);
     await openClient(page, sbServer);
     await expect
-      .poll(() => pageIsIndexed(page, `p${String(PAGES - 1).padStart(4, "0")}`), {
-        timeout: 120_000,
-      })
+      .poll(
+        () => pageIsIndexed(page, `p${String(PAGES - 1).padStart(4, "0")}`),
+        {
+          timeout: 120_000,
+        },
+      )
       .toBeGreaterThan(0);
     await expect
       .poll(() => pageIsIndexed(page, "Transform"), { timeout: 120_000 })
@@ -151,5 +164,72 @@ test.describe("index consistency across clients", () => {
     );
     expect(total).toBeGreaterThan(PAGES);
     expect(marked).toBe(total);
+  });
+
+  test("reloading scripts in one client reloads them in the others", async ({
+    page,
+    sbServer,
+  }) => {
+    test.setTimeout(180_000);
+
+    await openClient(page, sbServer);
+    const other = await page.context().newPage();
+    await openClient(other, sbServer);
+    await expect
+      .poll(
+        () => pageIsIndexed(page, `p${String(PAGES - 1).padStart(4, "0")}`),
+        {
+          timeout: 120_000,
+        },
+      )
+      .toBeGreaterThan(0);
+
+    // The other client holds a memoized scan from before the new script was
+    // indexed, which is what a reload there would read unless it bypasses the
+    // memo. Left alone the memo expires within seconds, and a client's own
+    // index write clears it, so the other client's TTL is held open and it is
+    // kept off the queue until its reload is done.
+    await other.evaluate(() => {
+      const objectIndex = (globalThis as any).client.objectIndex;
+      objectIndex.scanMemoTTLMs = 600_000;
+      objectIndex.isForeignReindexRunning = async () => true;
+    });
+    await evalLua(other, '#query[[from s = index.tag "space-lua"]]');
+
+    await writeFile(join(sbServer.spaceDir, "Transform.md"), transformPage);
+    await expect
+      .poll(() => pageIsIndexed(page, "Transform"), { timeout: 120_000 })
+      .toBeGreaterThan(0);
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (globalThis as any).client.mq.isQueueEmpty("indexQueue"),
+        ),
+      )
+      .toBe(true);
+    expect(await hasPageTransform(other)).toBe(false);
+
+    await runLua(page, "system.loadScripts()");
+    await expect
+      .poll(() => hasPageTransform(other), { timeout: 10_000 })
+      .toBe(true);
+    await other.evaluate(() => {
+      delete (globalThis as any).client.objectIndex.isForeignReindexRunning;
+    });
+
+    // With the reloading client gone, a page saved from now on can only be
+    // indexed by the other one, under whatever rules it holds.
+    await page.close();
+    await writeFile(join(sbServer.spaceDir, "Fresh.md"), "# Fresh\n");
+    await expect
+      .poll(
+        () =>
+          tryEval(
+            other,
+            '#query[[from p = index.pages() where p.name == "Fresh" and p.probeMark == "y"]]',
+          ),
+        { timeout: 60_000 },
+      )
+      .toBe(1);
   });
 });

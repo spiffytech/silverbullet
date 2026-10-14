@@ -134,6 +134,7 @@ export class ClientSystem {
   scriptsLoaded: boolean = false;
   private loadLuaScriptsInFlight: Promise<void> | undefined;
   private lastNotifiedQuarantineRefs: string | null = null;
+  private scriptReloadChannel: BroadcastChannel | undefined;
 
   readonly allKnownFiles = new BasenameIndex();
 
@@ -183,6 +184,41 @@ export class ClientSystem {
       },
     });
     this.serviceRegistry = new ServiceRegistry(this.eventHook, client.config);
+
+    // Every client on one origin indexes into the same shared index, each
+    // under its own loaded Space Lua. A client that never hears about a reload
+    // elsewhere keeps indexing whatever pages it picks up under the old rules.
+    if (typeof BroadcastChannel !== "undefined") {
+      const dbName = (ds.kv as any).dbName ?? "default";
+      this.scriptReloadChannel = new BroadcastChannel(`sb-scripts:${dbName}`);
+      this.scriptReloadChannel.onmessage = () => {
+        // A client still booting loads its scripts as part of the boot.
+        if (!this.client.systemReady) {
+          return;
+        }
+        // Each client re-indexes a changed page once its own file listing
+        // notices the change, so the page holding the new script can be
+        // mid-reindex when this message arrives. A page mid-reindex has no
+        // space-lua objects in the index, and a reload then would drop its
+        // scripts.
+        //
+        //
+        // The announcing client's writes never invalidated this client's
+        // memoized index scans, so a scan from the last few seconds can still
+        // predate the new script, and the reload would read that instead.
+        //
+        // reloadState is called directly rather than through system.loadScripts,
+        // because that syscall announces, and two clients would then trigger
+        // each other's reloads forever.
+        this.mq
+          .awaitEmptyQueue("indexQueue")
+          .then(() => {
+            this.objectIndex.forgetMemoizedScans();
+            return this.reloadState();
+          })
+          .catch(console.error);
+      };
+    }
 
     setInterval(() => {
       mq.requeueTimeouts(mqTimeout, mqTimeoutRetry, true).catch(console.error);
@@ -501,6 +537,15 @@ export class ClientSystem {
 
   localSyscall(name: string, args: any[]) {
     return this.system.localSyscall(name, args);
+  }
+
+  /**
+   * Tells the other clients on this database to reload their Space Lua.
+   * Only an explicit reload announces, so a reload that a broadcast triggered
+   * is never broadcast again.
+   */
+  announceScriptReload() {
+    this.scriptReloadChannel?.postMessage("reload");
   }
 
   public async reloadState() {

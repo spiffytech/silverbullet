@@ -557,6 +557,14 @@ export class ObjectIndex {
     // after a first boot.
     this.rebuildInProgress = true;
     try {
+      // Other clients stop polling once this lock is held, but a batch one of
+      // them leased just before keeps running under that client's own Space
+      // Lua. If its writes land after clearIndex below, they survive the
+      // reindex, because the reindex's own jobs skip the per-file clear. A
+      // leased message stays in the queue until it is acked, so an empty queue
+      // means every such batch has finished. This client keeps draining in the
+      // meantime, since rebuildInProgress exempts it from the pause.
+      await this.mq.awaitEmptyQueue("indexQueue");
       // Record that a reindex is underway *before* we delete the version key,
       // so an interruption between here and `markFullIndexComplete` is
       // recoverable (see `ensureFullIndex`).
@@ -729,6 +737,14 @@ export class ObjectIndex {
 
   private scanGeneration(tag: string): string {
     return `${this.allScansGeneration}:${this.scanGenerations.get(tag) ?? 0}`;
+  }
+
+  /**
+   * For a caller that knows another client has written to the shared index.
+   * Those writes do not invalidate this client's memo; only the TTL ages it.
+   */
+  forgetMemoizedScans() {
+    this.invalidateScanMemo();
   }
 
   /** Without `tags`, drops every tag's memo. */
